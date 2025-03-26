@@ -23,7 +23,7 @@ Emulator::Emulator(const std::string& filename) : syscall_handler() {
         Logger::Log(LogLevel::ERROR, "Falha ao inicializar memória para " + filename);
         return;
     }
-    jit = new JITCompiler(4096); // Tamanho inicial
+    jit = new JITCompiler(4096);
     is_running = true;
     rax = rcx = rdx = rbx = rsp = rbp = rsi = rdi = r8 = r9 = 0;
     carry_flag = zero_flag = direction_flag = false;
@@ -48,7 +48,7 @@ void Emulator::detectAddressSize() {
 uint64_t Emulator::maskRegister(uint64_t value) {
     if (address_size == 39) return value & 0x7FFFFFFFFF;
     if (address_size == 48) return value & 0xFFFFFFFFFFFF;
-    return value; // 64 bits
+    return value;
 }
 
 // --- MemoryManager ---
@@ -161,10 +161,10 @@ void Emulator::JITCompiler::write(const std::vector<uint8_t>& code) {
     offset += code.size();
 }
 
-void Emulator::JITCompiler::execute() {
-    using Func = void(*)();
+void Emulator::JITCompiler::execute(uint64_t* regs, uint64_t& rip, uint64_t& rsp) {
+    using Func = void(*)(uint64_t*, uint64_t&, uint64_t&);
     Func fn = reinterpret_cast<Func>(executable_memory);
-    fn();
+    fn(regs, rip, rsp); // Passa registradores, RIP e RSP
 }
 
 void Emulator::JITCompiler::clear() { offset = 0; }
@@ -193,9 +193,9 @@ void Emulator::initOpcodeTable() {
         [](Emulator* emu, uint8_t* code, uint32_t& instr_size, int64_t& jump_offset) {
             instr_size = 1;
             std::vector<uint8_t> arm64 = {
-                ARM64(0xB9400000), // LDRB W0, [X0] (carrega byte de [X0] em W0)
+                ARM64(0xB9400000), // LDRB W0, [X0]
                 ARM64(0x11000400), // ADD W0, W0, #1
-                ARM64(0xB9000000)  // STRB W0, [X0] (armazena de volta)
+                ARM64(0xB9000000)  // STRB W0, [X0]
             };
             return arm64;
         }
@@ -211,8 +211,10 @@ void Emulator::initOpcodeTable() {
         },
         [](Emulator* emu, uint8_t* code, uint32_t& instr_size, int64_t& jump_offset) {
             instr_size = 1;
-            uint32_t add = 0x91000400; // ADD X0, X0, #1
-            return std::vector<uint8_t>{ARM64(add)};
+            std::vector<uint8_t> arm64 = {
+                ARM64(0x91000400) // ADD X0, X0, #1
+            };
+            return arm64;
         }
     );
 
@@ -274,7 +276,7 @@ void Emulator::initOpcodeTable() {
             int8_t offset = (int8_t)code[1];
             instr_size = 2;
             jump_offset = offset;
-            uint32_t b = 0x14000000 | (offset & 0x03FFFFFF); // B #offset (26-bit)
+            uint32_t b = 0x14000000 | (offset & 0x03FFFFFF); // B #offset
             return std::vector<uint8_t>{ARM64(b)};
         }
     );
@@ -293,8 +295,7 @@ void Emulator::initOpcodeTable() {
         },
         [](Emulator* emu, uint8_t* code, uint32_t& instr_size, int64_t& jump_offset) {
             instr_size = 2;
-            // Syscall ARM64 (svc #0)
-            uint32_t svc = 0xD4000001;
+            uint32_t svc = 0xD4000001; // SVC #0
             return std::vector<uint8_t>{ARM64(svc)};
         }
     );
@@ -336,12 +337,14 @@ void Emulator::LoadBinary(const char* path) {
         ApplyRelocations(pe_info);
         mem->initStack(0xFFFFFFFF, pe_info.entry_point, pe_info.image_base);
         esp = mem->stack_pointer;
-        ebp = mem->allocateHeap(0x1000); // 4 KB de heap inicial
+        ebp = mem->allocateHeap(0x1000);
     }
 }
 
 void Emulator::run() {
     Logger::Log(LogLevel::INFO, "Iniciando execução em RIP: 0x" + std::to_string(mem->rip));
+    uint64_t regs[10] = {rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9}; // Passa registradores ao JIT
+
     while (is_running) {
         uint8_t* code = mem->getCodeAt(mem->rip);
         if (!code) break;
@@ -356,24 +359,36 @@ void Emulator::run() {
         } else {
             std::vector<uint8_t> arm64_code = opcode_table_[code[0]].translate(this, code, instr_size, jump_offset);
             if (arm64_code.empty()) {
+                // Fallback: Interpretador
                 executeInstruction(code[0], code, instr_size, jump_offset);
+                Logger::Log(LogLevel::DEBUG, "Fallback para interpretador em RIP: 0x" + std::to_string(mem->rip));
             } else {
+                // JIT Dynarec
                 jit->write(arm64_code);
                 block_cache[mem->rip] = {jump_offset, instr_size};
             }
         }
 
-        mem->rip = maskRegister(mem->rip + instr_size);
-        if (jump_offset != 0) {
-            if (jump_offset == -1) { // RET
-                mem->rip = maskRegister(mem->pop());
-                if (mem->rip == 0xFFFFFFFF) is_running = false;
-            } else {
-                mem->rip = maskRegister(mem->rip + jump_offset);
+        if (!block_cache.count(mem->rip)) {
+            // Se não foi traduzido, já foi interpretado
+            mem->rip = maskRegister(mem->rip + instr_size);
+            if (jump_offset != 0) {
+                if (jump_offset == -1) { // RET
+                    mem->rip = maskRegister(mem->pop());
+                    if (mem->rip == 0xFFFFFFFF) is_running = false;
+                } else {
+                    mem->rip = maskRegister(mem->rip + jump_offset);
+                }
             }
+        } else {
+            // Executa o bloco JIT
+            jit->execute(regs, mem->rip, rsp);
+            rax = regs[0]; rcx = regs[1]; rdx = regs[2]; rbx = regs[3];
+            rsp = regs[4]; rbp = regs[5]; rsi = regs[6]; rdi = regs[7];
+            r8 = regs[8]; r9 = regs[9];
+            esp = rsp; // Atualiza referência 32-bit
+            jit->clear();
         }
-        jit->execute();
-        jit->clear();
     }
     Logger::Log(LogLevel::INFO, "Execução finalizada em RIP: 0x" + std::to_string(mem->rip));
 }
